@@ -7,6 +7,7 @@ import type { Color } from './types/chess.types'
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type PromotionPiece = 'q' | 'r' | 'b' | 'n'
+type GameMode = 'human' | 'computer'
 
 interface PendingPromotion {
   from: string
@@ -24,6 +25,7 @@ type GameResult =
 const CLOCK_START = 60 // 1+0 bullet
 const CLOCKS_KEY = 'chess-app-clocks'
 const RESULT_KEY = 'chess-app-result'
+const STOCKFISH_URL = 'https://stockfish.online/api/s/v2.php'
 
 const PROMOTION_PIECES: PromotionPiece[] = ['q', 'r', 'b', 'n']
 const PIECE_LABELS: Record<PromotionPiece, string> = {
@@ -56,7 +58,47 @@ function loadResult(): GameResult {
   return null
 }
 
+/** Parse a UCI move token ("e7e5" or "bestmove e7e5 ponder e2e4") into { from, to, promotion? }. */
+function parseUci(raw: string): { from: string; to: string; promotion?: string } {
+  const token = raw.startsWith('bestmove ') ? raw.split(' ')[1] : raw
+  return {
+    from: token.slice(0, 2),
+    to: token.slice(2, 4),
+    ...(token.length > 4 ? { promotion: token[4] } : {}),
+  }
+}
+
 // ─── Sub-components ───────────────────────────────────────────────────────────
+
+function ModeToggle({
+  mode,
+  onChange,
+  disabled,
+}: {
+  mode: GameMode
+  onChange: (m: GameMode) => void
+  disabled: boolean
+}) {
+  return (
+    <div className="flex rounded-lg border border-slate-200 overflow-hidden text-xs font-semibold">
+      {(['human', 'computer'] as GameMode[]).map((m) => (
+        <button
+          key={m}
+          onClick={() => onChange(m)}
+          disabled={disabled || mode === m}
+          className={[
+            'flex-1 py-1.5 px-3 transition-colors',
+            mode === m
+              ? 'bg-slate-800 text-white cursor-default'
+              : 'bg-white text-slate-500 hover:bg-slate-50 disabled:opacity-40',
+          ].join(' ')}
+        >
+          {m === 'human' ? 'vs Human' : 'vs Computer'}
+        </button>
+      ))}
+    </div>
+  )
+}
 
 function ClockPanel({
   label,
@@ -192,19 +234,27 @@ function StatusBanner({
 function TurnIndicator({
   turn,
   isEffectivelyOver,
+  isAiThinking,
 }: {
   turn: Color
   isEffectivelyOver: boolean
+  isAiThinking: boolean
 }) {
   if (isEffectivelyOver) return null
+  if (isAiThinking) {
+    return (
+      <div className="flex items-center gap-3 px-1">
+        <div className="w-5 h-5 rounded-full bg-gray-900 border-2 border-gray-600 animate-pulse flex-shrink-0" />
+        <span className="text-sm font-medium text-slate-500 italic">Computer is thinking…</span>
+      </div>
+    )
+  }
   return (
     <div className="flex items-center gap-3 px-1">
       <div
         className={[
           'w-5 h-5 rounded-full border-2 flex-shrink-0',
-          turn === 'w'
-            ? 'bg-white border-gray-400 shadow-sm'
-            : 'bg-gray-900 border-gray-600',
+          turn === 'w' ? 'bg-white border-gray-400 shadow-sm' : 'bg-gray-900 border-gray-600',
         ].join(' ')}
       />
       <span className="text-sm font-medium text-gray-700">
@@ -219,14 +269,18 @@ function TurnIndicator({
 export default function App() {
   const { state, makeMove, undo, reset } = useChessGame()
 
+  const [gameMode, setGameMode] = useState<GameMode>('human')
+  const [isAiThinking, setIsAiThinking] = useState(false)
   const [clocks, setClocks] = useState(loadClocks)
   const [gameResult, setGameResult] = useState<GameResult>(loadResult)
   const [pendingPromotion, setPendingPromotion] = useState<PendingPromotion | null>(null)
   const historyBottomRef = useRef<HTMLDivElement>(null)
 
   const isEffectivelyOver = state.isGameOver || gameResult !== null
+  const boardLocked = isEffectivelyOver || isAiThinking
 
-  // Persist clocks and result to localStorage whenever they change
+  // ── Persistence ──
+
   useEffect(() => {
     localStorage.setItem(CLOCKS_KEY, JSON.stringify(clocks))
   }, [clocks])
@@ -235,7 +289,8 @@ export default function App() {
     localStorage.setItem(RESULT_KEY, JSON.stringify(gameResult))
   }, [gameResult])
 
-  // Clock tick — restarts cleanly whenever the active player changes
+  // ── Clock tick ──
+
   useEffect(() => {
     if (isEffectivelyOver || state.history.length === 0) return
     const id = setInterval(() => {
@@ -244,19 +299,53 @@ export default function App() {
     return () => clearInterval(id)
   }, [isEffectivelyOver, state.turn, state.history.length])
 
-  // Detect expiry after each clock update
   useEffect(() => {
     if (gameResult !== null) return
     const expired = clocks.w === 0 ? 'w' : clocks.b === 0 ? 'b' : null
     if (expired) setGameResult({ type: 'lost_on_time', loser: expired })
   }, [clocks, gameResult])
 
-  // Auto-scroll move history
+  // ── AI move ──
+
+  useEffect(() => {
+    if (gameMode !== 'computer' || state.turn !== 'b' || isEffectivelyOver) return
+
+    const controller = new AbortController()
+    setIsAiThinking(true)
+
+    fetch(`${STOCKFISH_URL}?fen=${encodeURIComponent(state.fen)}&depth=10`, {
+      signal: controller.signal,
+    })
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        return res.json() as Promise<{ success: boolean; bestmove: string }>
+      })
+      .then(({ success, bestmove }) => {
+        if (!success) throw new Error('API returned success=false')
+        makeMove(parseUci(bestmove))
+      })
+      .catch((err: Error) => {
+        if (err.name !== 'AbortError') console.error('Stockfish fetch failed:', err)
+      })
+      .finally(() => setIsAiThinking(false))
+
+    return () => controller.abort()
+    // makeMove is stable; state.fen is the right atomic trigger for position changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gameMode, state.fen, isEffectivelyOver])
+
+  // ── Move history scroll ──
+
   useEffect(() => {
     historyBottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [state.history.length])
 
   // ── Handlers ──
+
+  const handleModeChange = (m: GameMode) => {
+    setGameMode(m)
+    // isAiThinking resets via AbortController → .finally in the running fetch, if any
+  }
 
   const handleNewGame = () => {
     reset()
@@ -265,6 +354,7 @@ export default function App() {
     setClocks({ w: CLOCK_START, b: CLOCK_START })
     setGameResult(null)
     setPendingPromotion(null)
+    // isAiThinking clears automatically via AbortController when effect re-runs
   }
 
   const handleResign = () => {
@@ -273,7 +363,7 @@ export default function App() {
   }
 
   const onPieceDrop = ({ piece, sourceSquare, targetSquare }: PieceDropHandlerArgs): boolean => {
-    if (!targetSquare || isEffectivelyOver) return false
+    if (!targetSquare || boardLocked) return false
 
     const isPromotion =
       piece.pieceType[1]?.toLowerCase() === 'p' &&
@@ -292,12 +382,12 @@ export default function App() {
   }
 
   const handlePromotion = (promotionPiece: PromotionPiece) => {
-    if (!pendingPromotion || isEffectivelyOver) return
+    if (!pendingPromotion || boardLocked) return
     makeMove({ from: pendingPromotion.from, to: pendingPromotion.to, promotion: promotionPiece })
     setPendingPromotion(null)
   }
 
-  // ── Derived display data ──
+  // ── Derived display ──
 
   const movePairs = state.history.reduce<{ number: number; white: string; black?: string }[]>(
     (pairs, move, i) => {
@@ -320,7 +410,7 @@ export default function App() {
             options={{
               position: state.fen,
               onPieceDrop,
-              allowDrawingArrows: true,
+              allowDrawingArrows: !isAiThinking,
             }}
           />
           {pendingPromotion && (
@@ -331,25 +421,36 @@ export default function App() {
         {/* Sidebar */}
         <div className="flex-1 flex flex-col gap-4 md:h-[560px]">
 
-          {/* Clocks */}
-          <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4 flex gap-3">
-            <ClockPanel
-              label="Black"
-              time={clocks.b}
-              isActive={state.turn === 'b'}
-              isGameOver={isEffectivelyOver}
+          {/* Mode toggle + clocks */}
+          <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4 flex flex-col gap-3">
+            <ModeToggle
+              mode={gameMode}
+              onChange={handleModeChange}
+              disabled={isAiThinking}
             />
-            <ClockPanel
-              label="White"
-              time={clocks.w}
-              isActive={state.turn === 'w'}
-              isGameOver={isEffectivelyOver}
-            />
+            <div className="flex gap-3">
+              <ClockPanel
+                label="Black"
+                time={clocks.b}
+                isActive={state.turn === 'b'}
+                isGameOver={isEffectivelyOver}
+              />
+              <ClockPanel
+                label="White"
+                time={clocks.w}
+                isActive={state.turn === 'w'}
+                isGameOver={isEffectivelyOver}
+              />
+            </div>
           </div>
 
           {/* Turn indicator + status banner */}
           <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4 flex flex-col gap-3">
-            <TurnIndicator turn={state.turn} isEffectivelyOver={isEffectivelyOver} />
+            <TurnIndicator
+              turn={state.turn}
+              isEffectivelyOver={isEffectivelyOver}
+              isAiThinking={isAiThinking}
+            />
             <StatusBanner status={state.status} turn={state.turn} gameResult={gameResult} />
           </div>
 
@@ -384,14 +485,14 @@ export default function App() {
           <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-4 flex gap-3">
             <button
               onClick={undo}
-              disabled={state.history.length === 0 || isEffectivelyOver}
+              disabled={state.history.length === 0 || boardLocked}
               className="flex-1 py-2 text-sm font-medium rounded-lg border border-slate-200 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
             >
               Undo
             </button>
             <button
               onClick={handleResign}
-              disabled={isEffectivelyOver || state.history.length === 0}
+              disabled={isEffectivelyOver || state.history.length === 0 || isAiThinking}
               className="flex-1 py-2 text-sm font-medium rounded-lg border border-slate-200 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
             >
               Resign
